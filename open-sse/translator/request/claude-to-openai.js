@@ -10,6 +10,24 @@ function stripAnthropicBillingHeader(text) {
   return text.replace(/^x-anthropic-billing-header:[^\n]*(?:\r?\n)?/i, "");
 }
 
+// Extract plain text from a mid-conversation system message's content, which may
+// be a string or an array of Claude blocks. Drops cache_control and other
+// Anthropic-only fields (only .text is kept).
+function systemMessageText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter(b => b && b.type === CLAUDE_BLOCK.TEXT)
+      .map(b => b.text || "")
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (content && typeof content === "object" && typeof content.text === "string") {
+    return content.text;
+  }
+  return "";
+}
+
 // Convert Claude request to OpenAI format
 export function claudeToOpenAIRequest(model, body, stream) {
   const result = {
@@ -29,23 +47,33 @@ export function claudeToOpenAIRequest(model, body, stream) {
   }
 
   // System message
+  // Base system prompt built from top-level body.system. Role "system" messages
+  // found inside body.messages (Anthropic mid-conversation-system beta, which the
+  // Anthropic API accepts) are merged into this prompt below so they can never
+  // land as a trailing turn — a large system block left at the end of the
+  // conversation makes the model treat the prior user turn as already answered.
+  let systemBase = "";
   if (body.system) {
-    const systemContent = Array.isArray(body.system)
+    systemBase = Array.isArray(body.system)
       ? body.system.map(s => stripAnthropicBillingHeader(s.text || "")).filter(Boolean).join("\n")
       : stripAnthropicBillingHeader(body.system);
-    
-    if (systemContent) {
-      result.messages.push({
-        role: ROLE.SYSTEM,
-        content: systemContent
-      });
-    }
   }
 
   // Convert messages
+  const midSystemTexts = [];
   if (body.messages && Array.isArray(body.messages)) {
     for (let i = 0; i < body.messages.length; i++) {
       const msg = body.messages[i];
+
+      // Hoist role "system" messages out of the transcript: collect their text in
+      // original order and skip them here. They are appended to the system prompt
+      // after the loop.
+      if (msg && msg.role === ROLE.SYSTEM) {
+        const text = systemMessageText(msg.content);
+        if (text.trim()) midSystemTexts.push(text);
+        continue;
+      }
+
       const converted = convertClaudeMessage(msg);
       if (converted) {
         // Handle array of messages (multiple tool results)
@@ -56,6 +84,17 @@ export function claudeToOpenAIRequest(model, body, stream) {
         }
       }
     }
+  }
+
+  // Merge hoisted mid-conversation system text after the top-level system prompt,
+  // in original order, separated by a blank line.
+  if (midSystemTexts.length) {
+    const merged = [systemBase, ...midSystemTexts].filter(t => t && t.trim()).join("\n\n");
+    if (merged) {
+      result.messages.unshift({ role: ROLE.SYSTEM, content: merged });
+    }
+  } else if (systemBase) {
+    result.messages.unshift({ role: ROLE.SYSTEM, content: systemBase });
   }
 
   // Fix missing tool responses - OpenAI requires every tool_call to have a response.
@@ -92,6 +131,10 @@ export function claudeToOpenAIRequest(model, body, stream) {
 
   return result;
 }
+
+// Build marker: a string literal survives minification, so grepping the bundled
+// .next chunk proves this patched translator (not the stock one) was compiled in.
+claudeToOpenAIRequest.sysfix = "sysfix.3-hoist-mid-conversation-system";
 
 // Fix missing tool responses - add empty responses for tool_calls without responses
 function fixMissingToolResponsesOpenAI(messages) {
